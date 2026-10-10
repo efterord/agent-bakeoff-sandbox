@@ -46,10 +46,12 @@ jobs:
       - name: paid pilot (self-test first; aborts on any isolation failure)
         env:
           PILOT_REAL_CONFIRMED: "yes"
+          HERMES_APPROVAL: ${{ inputs.hermes_approval }}
         run: |
+          case "$HERMES_APPROVAL" in deny|off) ;; *) echo "bad hermes_approval"; exit 2;; esac
           IMG="$RUNNER_TEMP/out/images/images.json"
           "$RUNNER_TEMP/venv/bin/python" -m pilot.run_pilot --mode real --out "$RUNNER_TEMP/out/pilot" \
-            --key-file "$RUNNER_TEMP/anthropic_key" --hermes-approval "${{ inputs.hermes_approval }}" \
+            --key-file "$RUNNER_TEMP/anthropic_key" --hermes-approval "$HERMES_APPROVAL" \
             --agent-image "$(python3 -c "import json;print(json.load(open('$IMG'))['agent_image_id'])")" \
             --gate-image "$(python3 -c "import json;print(json.load(open('$IMG'))['gate_image_id'])")"
       - name: remove key file
