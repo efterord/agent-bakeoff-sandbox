@@ -7,8 +7,14 @@
    vision requirement checks) and the skill prerequisites as the terminal sees
    them; FAIL CLOSED (no task run) if the powerpoint skill or its tools are not
    available;
-4. post the task to the Runs API, stream events to /work/out/trace/, never
-   approve anything (a run that asks for approval is stopped and recorded).
+4. post the task to the Runs API, stream events to /work/out/trace/.
+
+Approvals: the harness NEVER approves. PILOT_HERMES_APPROVAL selects what
+happens when Hermes's own command guard asks for approval:
+  deny (default) - answer "deny", record the request, let the run continue;
+  stop           - stop the run at the first request;
+  off            - Hermes's guard is switched off inside the sealed sandbox
+                   (approvals.mode: off), so nothing is ever asked.
 """
 from __future__ import annotations
 
@@ -32,6 +38,8 @@ HERMES = "/opt/hermes/.venv/bin/hermes"
 HPY = "/opt/hermes/.venv/bin/python"
 PORT = 8642
 RUN_LIMIT_S = int(os.environ.get("PILOT_RUN_LIMIT_S", "840"))
+APPROVAL = os.environ.get("PILOT_HERMES_APPROVAL", "deny")
+MAX_DENIALS = 25
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
 REQUIRED_TOOLSETS = {"terminal", "skills", "vision", "file"}
 FORBIDDEN_TOOLSETS = {"browser", "code_execution", "web", "delegation", "computer_use", "memory", "cronjob"}
@@ -122,7 +130,10 @@ def main():
     hh = home / ".hermes"
     hh.mkdir(parents=True, exist_ok=True)
     tmpl = Path(__file__).with_name("hermes_config.yaml.tmpl").read_text(encoding="utf-8")
+    if APPROVAL == "off":
+        tmpl += "approvals:\n  mode: \"off\"\n"
     (hh / "config.yaml").write_text(tmpl, encoding="utf-8")
+    summary["approval_policy"] = APPROVAL
     key = secrets.token_urlsafe(32)
     env = dict(os.environ, HERMES_HOME=str(hh), API_SERVER_ENABLED="true", API_SERVER_HOST="127.0.0.1",
                API_SERVER_PORT=str(PORT), API_SERVER_KEY=key, ANTHROPIC_API_KEY="sandbox-no-key",
@@ -191,7 +202,7 @@ def main():
         sink, stop = [], threading.Event()
         th = threading.Thread(target=events, args=(run_id, key, stop, sink), daemon=True)
         th.start()
-        st, t1 = {}, time.time()
+        st, t1, approvals, seen = {}, time.time(), [], set()
         while True:
             try:
                 st = api("GET", f"/v1/runs/{run_id}", key)
@@ -201,14 +212,33 @@ def main():
             if s in TERMINAL:
                 break
             if s == "waiting_for_approval":
-                summary["approval_requested"] = str(st.get("approval"))[:500]
-                try:
-                    api("POST", f"/v1/runs/{run_id}/stop", key, {})
-                except Exception:
-                    pass
-                time.sleep(3)
-                s = "stopped_on_approval"
-                break
+                appr = st.get("approval") or {}
+                rq = appr.get("request_id") or str(appr.get("command", ""))[:200]
+                if rq in seen:
+                    time.sleep(1)
+                    continue
+                seen.add(rq)
+                rec = {"t": round(time.time(), 3), "pattern": appr.get("pattern_key"),
+                       "command": str(appr.get("command", ""))[:1500], "policy": APPROVAL}
+                approvals.append(rec)
+                with open(TRACE / "approvals.jsonl", "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if APPROVAL != "deny" or len(approvals) > MAX_DENIALS:
+                    try:
+                        api("POST", f"/v1/runs/{run_id}/stop", key, {})
+                    except Exception:
+                        pass
+                    time.sleep(3)
+                    s = "stopped_on_approval"
+                    break
+                try:  # never approve: deny exactly this request and let the agent continue
+                    api("POST", f"/v1/runs/{run_id}/approval", key,
+                        {"choice": "deny", "request_id": appr.get("request_id")} if appr.get("request_id")
+                        else {"choice": "deny"})
+                except urllib.error.HTTPError as e:
+                    rec["deny_error"] = e.code
+                time.sleep(1)
+                continue
             if time.time() - t1 > RUN_LIMIT_S:
                 try:
                     api("POST", f"/v1/runs/{run_id}/stop", key, {})
@@ -221,7 +251,8 @@ def main():
         th.join(timeout=5)
         tool_calls = [e.get("tool") for e in sink if e.get("event") == "tool.started"]
         summary.update(status=s or st.get("status"), hermes_status=st.get("status"), tool_calls=len(tool_calls),
-                       tools=tool_calls, runtime_usage=st.get("usage") or {},
+                       tools=tool_calls, runtime_usage=st.get("usage") or {}, approval_requests=len(approvals),
+                       approval_patterns=sorted({a["pattern"] or "" for a in approvals}),
                        error=str(st.get("error", ""))[:300] or None)
         return 0
     finally:

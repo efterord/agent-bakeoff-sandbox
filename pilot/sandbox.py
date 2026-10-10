@@ -46,7 +46,7 @@ def prepare(tdir: Path, files: dict[str, Path | bytes]) -> tuple[Path, Path]:
 
 
 def run(name: str, image: str, entry: list[str], in_dir: Path, out_dir: Path, gate_dir: Path | None,
-        wall_s: int = WALL_S, run_id: str = "") -> dict:
+        wall_s: int = WALL_S, run_id: str = "", extra_env: dict | None = None) -> dict:
     argv = ["docker", "run", "-d", "--name", name,
             "--network", "none", "--read-only",
             "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
@@ -62,6 +62,7 @@ def run(name: str, image: str, entry: list[str], in_dir: Path, out_dir: Path, ga
              "--init", "--stop-timeout", "5", "--hostname", "sandbox",
              "--log-opt", "max-size=5m", "--log-opt", "max-file=1",
              "--env", "HOME=/home/agent", "--env", f"PILOT_RUN={run_id}",
+             *[x for k, v in sorted((extra_env or {}).items()) if k.startswith("PILOT_") for x in ("--env", f"{k}={v}")],
              "--entrypoint", entry[0], image, *entry[1:]]
     t0 = time.time()
     started = sh(argv, check=False)

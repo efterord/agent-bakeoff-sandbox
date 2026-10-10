@@ -7,6 +7,9 @@ model:
   base_url: http://127.0.0.1:8088
   default: "claude-haiku-4-5-20251001"
   api_key: sandbox-no-key
+  # Haiku 4.5 context window. Set explicitly: with a localhost base_url Hermes otherwise
+  # probes local-server endpoints (/api/show, /props, ...) that the gate refuses.
+  context_length: 200000
 platform_toolsets:
   api_server: [file, skills, terminal, vision, todo]
 agent:
