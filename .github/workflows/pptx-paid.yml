@@ -1,0 +1,81 @@
+# PAID pilot. Manual dispatch only, main only, protected environment "bakeoff"
+# (required reviewer). The API key is referenced in exactly one step, which
+# writes it to a 0600 file that only the gate container mounts; the harness
+# deletes the host file as soon as the gate is up. Without the secret this
+# workflow fails closed before any model call.
+name: pptx-pilot-paid
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type RUN-PAID-PILOT to start a paid run (gate hard cap USD 10)"
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: pptx-pilot-paid
+  cancel-in-progress: false
+jobs:
+  paid:
+    if: ${{ inputs.confirm == 'RUN-PAID-PILOT' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: bakeoff
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: harness venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q --disable-pip-version-check -r requirements-harness.txt
+      - name: build pinned images
+        run: bash ci/build_images.sh "$RUNNER_TEMP/out/images"
+      - name: key to gate-only file (the only step that references the secret)
+        env:
+          KEY: ${{ secrets.BAKEOFF_ANTHROPIC_API_KEY }}
+        run: |
+          test -n "$KEY" || { echo "secret BAKEOFF_ANTHROPIC_API_KEY is not set - refusing"; exit 2; }
+          umask 077
+          printf '%s' "$KEY" > "$RUNNER_TEMP/anthropic_key"
+      - name: paid pilot (self-test first; aborts on any isolation failure)
+        env:
+          PILOT_REAL_CONFIRMED: "yes"
+        run: |
+          IMG="$RUNNER_TEMP/out/images/images.json"
+          "$RUNNER_TEMP/venv/bin/python" -m pilot.run_pilot --mode real --out "$RUNNER_TEMP/out/pilot" \
+            --key-file "$RUNNER_TEMP/anthropic_key" \
+            --agent-image "$(python3 -c "import json;print(json.load(open('$IMG'))['agent_image_id'])")" \
+            --gate-image "$(python3 -c "import json;print(json.load(open('$IMG'))['gate_image_id'])")"
+      - name: remove key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/anthropic_key"
+      - name: job summary
+        if: always()
+        run: cat "$RUNNER_TEMP/out/pilot/report.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      - name: split artifacts
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/art"
+          mv "$RUNNER_TEMP/out/pilot/human-review" "$RUNNER_TEMP/art/human-review" 2>/dev/null || true
+          mv "$RUNNER_TEMP/out/pilot/sealed" "$RUNNER_TEMP/art/sealed" 2>/dev/null || true
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pilot-paid-results
+          path: ${{ runner.temp }}/out
+          retention-days: 7
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: human-review-blind
+          path: ${{ runner.temp }}/art/human-review
+          retention-days: 7
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sealed-arm-key
+          path: ${{ runner.temp }}/art/sealed
+          retention-days: 7
+          if-no-files-found: ignore

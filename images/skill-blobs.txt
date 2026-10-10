@@ -1,0 +1,8 @@
+# git blob SHA1  path   (NousResearch/hermes-agent @ 818c13be1dc4fd28987e1e881a9408224afd4535, MIT)
+0dddbf167070de3fd2f48f192feb198ac98d1f63  skills/productivity/powerpoint/LICENSE
+4d73a518aa5b10ba4b7e644d47e9eebfb600cf72  skills/productivity/powerpoint/SKILL.md
+71d18765a876b4e7d343f51ff5ccc302a1d4a9c7  skills/productivity/powerpoint/scripts/pptx_create.py
+9acaacd461a91fc7021629eeaff591c12558a358  skills/productivity/powerpoint/scripts/pptx_edit.py
+024036ae45bef17bc0b22c4563f0c835e2df4f95  skills/productivity/powerpoint/scripts/pptx_from_template.py
+09ea78fcc79da2df9666b4e53ed3067889a39dc5  skills/productivity/powerpoint/scripts/pptx_read.py
+7d54aa02bc519f2214726b0d9a4dd0e4ddf5ba00  skills/productivity/powerpoint/scripts/pptx_render.py

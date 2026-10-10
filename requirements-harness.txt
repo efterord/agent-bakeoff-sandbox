@@ -1,0 +1,7 @@
+# Host-side harness (GitHub runner only): fixtures, checks, scoring, report.
+python-pptx==1.0.2
+lxml==5.3.0
+Pillow==11.0.0
+XlsxWriter==3.2.0
+typing_extensions==4.12.2
+numpy==2.1.3

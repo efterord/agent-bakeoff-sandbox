@@ -1,0 +1,84 @@
+# FAKE mode only: scripted fake model, no secret, no environment, no paid call.
+name: pptx-pilot-fake
+on:
+  push:
+    branches: [main]
+    paths: ["agent/**", "gate/**", "pilot/**", "pptxbench/**", "images/**", "ci/**", "tests/**",
+            "requirements-harness.txt", ".github/workflows/pptx-fake.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pptx-pilot-fake
+  cancel-in-progress: true
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: unit tests (pure python + python-pptx)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          pip install -q --disable-pip-version-check -r requirements-harness.txt pytest==8.3.3
+          python -m pytest -q tests --basetemp "$RUNNER_TEMP/pytest"
+  e2e:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: harness venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q --disable-pip-version-check -r requirements-harness.txt
+      - name: build pinned images
+        run: bash ci/build_images.sh "$RUNNER_TEMP/out/images"
+      - name: fake pilot (self-test, 4 tasks x 2 reps x 2 arms, injection canary)
+        run: |
+          IMG="$RUNNER_TEMP/out/images/images.json"
+          "$RUNNER_TEMP/venv/bin/python" -m pilot.run_pilot --mode fake --out "$RUNNER_TEMP/out/pilot" \
+            --agent-image "$(python3 -c "import json;print(json.load(open('$IMG'))['agent_image_id'])")" \
+            --gate-image "$(python3 -c "import json;print(json.load(open('$IMG'))['gate_image_id'])")"
+      - name: job summary
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/out/pilot/report.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no report" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import json, os
+          st = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "out/pilot/selftest.json")))
+          print("\n## Isolation self-test\n\n| check | pass | detail |\n|---|---|---|")
+          for k, v in st["checks"].items():
+              print(f"| {k} | {'yes' if v['pass'] else '**NO**'} | {v['detail'][:90].replace('|', '/')} |")
+          PY
+      - name: split artifacts (blind package and sealed key separately)
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/art"
+          mv "$RUNNER_TEMP/out/pilot/human-review" "$RUNNER_TEMP/art/human-review" 2>/dev/null || true
+          mv "$RUNNER_TEMP/out/pilot/sealed" "$RUNNER_TEMP/art/sealed" 2>/dev/null || true
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pilot-fake-results
+          path: ${{ runner.temp }}/out
+          retention-days: 7
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: human-review-blind
+          path: ${{ runner.temp }}/art/human-review
+          retention-days: 7
+          if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sealed-arm-key
+          path: ${{ runner.temp }}/art/sealed
+          retention-days: 7
+          if-no-files-found: ignore

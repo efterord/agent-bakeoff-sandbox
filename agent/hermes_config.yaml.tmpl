@@ -1,0 +1,31 @@
+# Hermes v0.21.6 config for the PPTX pilot H-exec arm (written to the per-run
+# tmpfs HERMES_HOME by agent/hermes_entry.py). The only model endpoint is the
+# in-container forwarder to the per-run gate socket; the key is a dummy.
+_config_version: 50
+model:
+  provider: anthropic
+  base_url: http://127.0.0.1:8088
+  default: "claude-haiku-4-5-20251001"
+  api_key: sandbox-no-key
+platform_toolsets:
+  api_server: [file, skills, terminal, vision, todo]
+agent:
+  max_turns: 40
+  disabled_toolsets: [browser, code_execution, web, search, x_search, memory, session_search, cronjob,
+                      delegation, kanban, video, image_gen, video_gen, tts, computer_use, clarify,
+                      connections, project, start_chat, catalog]
+terminal:
+  backend: local
+  cwd: /work/out/w
+  timeout: 180
+memory:
+  memory_enabled: false
+auth:
+  adopt_external_logins: false
+security:
+  allow_lazy_installs: false
+  allow_private_urls: false
+telemetry:
+  shared_metrics:
+    enabled: false
+    send: false
