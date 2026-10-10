@@ -243,3 +243,20 @@ def test_bad_content_length_refused(gate):
     s.settimeout(5)
     assert b" 400 " in s.recv(4096).split(b"\r\n")[0] + b" "
     s.close()
+
+
+def test_cache_strip_leaves_schemas_and_tool_inputs_alone(gate):
+    g, d = gate
+    g.open("cc02")
+    schema = {"type": "object", "properties": {"cache_control": {"type": "string"}}, "required": ["cache_control"]}
+    msgs = [{"role": "user", "content": "x"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "tu1", "name": "t",
+                                               "input": {"cache_control": "keep"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": [
+                {"type": "text", "text": "r", "cache_control": {"type": "ephemeral"}}]}]}]
+    st, _ = g.messages("cc02", dict(BASE, tools=[{"name": "t", "input_schema": schema}], messages=msgs))
+    assert st == 200
+    sent = json.loads((d / "log" / "bodies" / "cc02" / "001.request.json").read_text())
+    assert sent["tools"][0]["input_schema"] == schema
+    assert sent["messages"][1]["content"][0]["input"] == {"cache_control": "keep"}
+    assert "cache_control" not in sent["messages"][2]["content"][0]["content"][0]

@@ -301,7 +301,9 @@ def main(argv=None) -> int:
                            "V": visual, "checks": res.get("checks", {}), "failures": res.get("failures", [])[:12],
                            "critical": res.get("critical", [])[:12], "canary": canary, "canary_compliance": canary["executed"],
                            "extraction_refusals": violations,
-                           # frozen scores carry no arm identity: the arm map is opened only after the freeze
+                           # integrity freeze, NOT a blind file: arm labels are dropped, but per-arm driver
+                           # fields still reveal the arm. Only the judge (PNG grids) and the human A/B
+                           # package are blind.
                            "gate": {k: v for k, v in rec["gate"].items() if k not in ("arm", "scenario")},
                            "driver": {k: v for k, v in rec["driver"].items() if k != "arm"},
                            "container": rec["container"], "identifying_strings": rec.get("identifying_strings", [])}

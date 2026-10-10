@@ -149,18 +149,20 @@ def usd(model, usage):
             + cw_cost + int(usage.get("cache_read_input_tokens") or 0) * pcr) / 1e6
 
 
-def _strip_cache_markers(obj) -> int:
-    """Remove every cache_control key below the top level (system, messages, tools). Returns the count."""
+def _strip_cache_markers(body: dict) -> int:
+    """Remove cache_control from every place the API reads it: system blocks, tool definitions, message
+    content blocks and blocks nested in tool_result content. Tool schemas and tool_use inputs are data
+    and are left untouched. Returns the number of markers removed."""
+    def pop(d):
+        return 1 if isinstance(d, dict) and d.pop("cache_control", None) is not None else 0
     n = 0
-    if isinstance(obj, dict):
-        if "cache_control" in obj:
-            obj.pop("cache_control")
-            n += 1
-        for v in obj.values():
-            n += _strip_cache_markers(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            n += _strip_cache_markers(v)
+    if isinstance(body.get("system"), list):
+        n += sum(pop(b) for b in body["system"])
+    for t in body.get("tools") or []:
+        n += pop(t)
+    for m in body.get("messages") or []:
+        if isinstance(m, dict) and isinstance(m.get("content"), list):
+            n += sum(pop(b) for b in _walk_blocks(m["content"]))
     return n
 
 
@@ -197,7 +199,7 @@ def apply_policy(body: dict, kind: str, headers) -> tuple[dict, dict]:
         mt = 4096
     body["max_tokens"] = max(1, min(mt, MAX_TOKENS))
     body.pop("cache_control", None)
-    facts["cache_markers_stripped"] = sum(_strip_cache_markers(body.get(k)) for k in ("system", "messages", "tools"))
+    facts["cache_markers_stripped"] = _strip_cache_markers(body)
     body["cache_control"] = {"type": "ephemeral"}
     for t in body.get("tools") or []:
         if not isinstance(t, dict):
@@ -388,8 +390,14 @@ class RunHandler(BaseHTTPRequestHandler):
             return self._send(400, err_body("budget_exhausted", "gate: " + reason))
         stream = bool(body.get("stream"))
         save_dir = st.log_dir / "bodies" / run["id"]
-        save_dir.mkdir(parents=True, exist_ok=True)
-        (save_dir / f"{seq:03d}.request.json").write_bytes(json.dumps(body, ensure_ascii=False).encode())
+        try:   # full logging is a precondition: never send what could not be logged
+            save_dir.mkdir(parents=True, exist_ok=True)
+            (save_dir / f"{seq:03d}.request.json").write_bytes(json.dumps(body, ensure_ascii=False).encode())
+        except OSError:
+            with st.lock:
+                run["reserved"] -= reserve
+                st.reserved[kind] -= worst
+            return self._send(500, err_body("api_error", "gate: request log write failed; not sent"))
         usage, status, stop, used_tools, err = {}, 0, None, [], None
         self.upstream_request_id = None
         try:
@@ -412,7 +420,10 @@ class RunHandler(BaseHTTPRequestHandler):
                 self._send(502, err_body("api_error", "gate: upstream error"))
             except Exception:
                 pass
-        cost = usd(model, usage) if usage else 0.0
+        try:
+            cost = usd(model, usage) if usage else 0.0
+        except (TypeError, ValueError, AttributeError):
+            cost, err = worst, err or "unparsable usage"
         # Unknown cost (exception, client gone, truncated stream, unparsable 200): charge the worst case.
         complete = status == 200 and bool(usage) and (stop is not None or not stream)
         charged_worst = err is not None or (status == 200 and not complete)
