@@ -1,0 +1,52 @@
+# Omnigent evaluation PoC (efterord/ai-platform#606 §22).
+# No model, no secret, no environment, no paid call. Installs the released
+# wheel, measures its footprint, probes permission/telemetry defaults, and
+# measures idle server RSS with SQLite. Telemetry and the update check are off.
+name: omnigent-poc
+on:
+  push:
+    branches: [omnigent-poc]
+    paths: ["omnigent-poc/**", ".github/workflows/omnigent-poc.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: omnigent-poc
+  cancel-in-progress: true
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DO_NOT_TRACK: "1"
+      OMNIGENT_ANALYTICS: "0"
+      OMNIGENT_NO_UPDATE_CHECK: "1"
+      OMNIGENT_VERSION: "0.17.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install release into a venv and measure footprint
+        run: |
+          python3 --version
+          python3 -m venv "$RUNNER_TEMP/venv"
+          start=$(date +%s)
+          "$RUNNER_TEMP/venv/bin/pip" install -q --no-cache-dir --disable-pip-version-check "omnigent==${OMNIGENT_VERSION}"
+          echo "install_seconds=$(( $(date +%s) - start ))"
+          echo "venv_mb=$(du -sm "$RUNNER_TEMP/venv" | cut -f1)"
+          "$RUNNER_TEMP/venv/bin/pip" list --format=freeze | wc -l | sed 's/^/installed_packages=/'
+          du -sm "$RUNNER_TEMP"/venv/lib/python3*/site-packages/* | sort -rn | head -12
+      - name: probe defaults (pure functions, no model)
+        run: |
+          mkdir -p "$RUNNER_TEMP/empty-home"
+          POC_EMPTY_HOME="$RUNNER_TEMP/empty-home" "$RUNNER_TEMP/venv/bin/python" omnigent-poc/probe.py | tee "$RUNNER_TEMP/probe.json"
+      - name: idle server RSS (SQLite, loopback, no agents)
+        run: |
+          mkdir -p "$RUNNER_TEMP/srv"
+          cd "$RUNNER_TEMP/srv"
+          HOME="$RUNNER_TEMP/srv" timeout 90 "$RUNNER_TEMP/venv/bin/omnigent" server --host 127.0.0.1 --port 6767 --no-open \
+            --database-uri "sqlite:///$RUNNER_TEMP/srv/omnigent.db" > server.log 2>&1 &
+          sleep 45
+          echo "listening: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6767/ || true)"
+          ps -eo pid,rss,args | grep -i '[o]mnigent' | awk '{s+=$2; print} END {print "total_rss_mb=" int(s/1024)}'
+          tail -20 server.log || true
