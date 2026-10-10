@@ -31,8 +31,14 @@ BASE = {"model": "claude-opus-5", "max_tokens": 99999, "temperature": 0.7, "meta
         "messages": [{"role": "user", "content": "hello"}]}
 
 
-def ledger(d):
-    return [json.loads(x) for x in (d / "log" / "ledger.jsonl").read_text().splitlines()]
+def ledger(d, want=1):
+    # the gate writes its ledger line right after sending the response: poll briefly
+    for _ in range(100):
+        rows = [json.loads(x) for x in (d / "log" / "ledger.jsonl").read_text().splitlines()]
+        if sum(1 for r in rows if r.get("event") == "request") >= want:
+            return rows
+        time.sleep(0.02)
+    return rows
 
 
 def test_model_pinned_and_params_rewritten(gate):
