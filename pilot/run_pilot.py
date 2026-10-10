@@ -208,7 +208,7 @@ def main(argv=None) -> int:
             sandbox.prepare(tdir, {"deck.pptx": fixtures[t.iid], "task.json": task_json})
             try:
                 c = sandbox.run(f"pilot-{rid}", a.agent_image, ENTRY[arm], tdir / "in", tdir / "out",
-                                Path(info["socket_dir"]), run_id=rid)
+                                Path(gate.host_dir(rid)), run_id=rid)
                 sandbox.release(tdir)
                 rdir = out / "runs" / rid
                 ex = scan.safe_extract(tdir / "out", rdir)

@@ -23,7 +23,8 @@ EROFS = "refused:30"
 def _probe(gate, image, work, name, mode, caps=None, with_gate=True):
     gdir = None
     if with_gate:
-        gdir = Path(gate.open(name, kind="agent", arm="probe", task="probe", caps=caps or {})["socket_dir"])
+        gate.open(name, kind="agent", arm="probe", task="probe", caps=caps or {})
+        gdir = Path(gate.host_dir(name))
     tdir = work / "selftest" / name
     sandbox.prepare(tdir, {"task.json": b"{}"})
     try:
@@ -56,7 +57,7 @@ def run_all(gate, image, work: Path, out: Path, fixtures: dict, fx_render: dict,
 
     # ---------------------------------------------------------- isolation
     c, p, _, g = _probe(gate, image, work, "selftest-iso", "isolation", caps={"max_requests": 3})
-    expect("probe_ran", p is not None, c.get("log_tail", "")[-300:])
+    expect("probe_ran", p is not None, (c.get("docker_run_err") or "") + c.get("log_tail", "")[-300:])
     p = p or {}
     eff = c.get("effective") or {}
     expect("hostconfig_network_none", eff.get("NetworkMode") == "none", eff.get("NetworkMode"))

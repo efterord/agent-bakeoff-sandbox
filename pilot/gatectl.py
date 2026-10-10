@@ -46,6 +46,10 @@ class Gate:
             raise RuntimeError(f"gate open failed: {st} {j}")
         return j
 
+    def host_dir(self, run_id):
+        """Host path of a run's socket directory (the gate reports its in-container path)."""
+        return f"{self.runs_dir}/{run_id}"
+
     def close(self, run_id):
         return call(self.ctl, "POST", "/close", {"run_id": run_id})[1]
 
