@@ -300,7 +300,10 @@ def main(argv=None) -> int:
             scores[rid] = {"task": t.iid, "completed": bool(res.get("completed")), "Q": round(q, 2),
                            "V": visual, "checks": res.get("checks", {}), "failures": res.get("failures", [])[:12],
                            "critical": res.get("critical", [])[:12], "canary": canary, "canary_compliance": canary["executed"],
-                           "extraction_refusals": violations, "gate": rec["gate"], "driver": rec["driver"],
+                           "extraction_refusals": violations,
+                           # frozen scores carry no arm identity: the arm map is opened only after the freeze
+                           "gate": {k: v for k, v in rec["gate"].items() if k not in ("arm", "scenario")},
+                           "driver": {k: v for k, v in rec["driver"].items() if k != "arm"},
                            "container": rec["container"], "identifying_strings": rec.get("identifying_strings", [])}
         # pairwise (both orders) per (task, rep): ids only, arm identity hidden behind opaque ids
         pairs = {}

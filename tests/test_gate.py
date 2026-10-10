@@ -72,7 +72,11 @@ def test_judge_kind_pins_judge_model_and_disables_thinking(gate):
     ({"messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "url", "url": "https://e/x"}}]}]},
      "base64 only"),
     ({"messages": [{"role": "user", "content": [{"type": "document", "source": {"type": "file", "file_id": "f"}}]}]},
-     "base64 only"),
+     "block type 'document'"),
+    ({"messages": [{"role": "user", "content": [{"type": "document", "source": {
+        "type": "base64", "media_type": "application/pdf", "data": "QQ=="}}]}]}, "block type 'document'"),
+    ({"messages": [{"role": "user", "content": [{"type": "search_result", "source": "x", "title": "t",
+                                                 "content": []}]}]}, "block type"),
     ({"messages": [{"role": "user", "content": "token sk-ant-api03-abcdefghijklmnop"}]}, "tripwire"),
 ])
 def test_policy_rejections(gate, extra, why):
@@ -162,3 +166,80 @@ def test_fake_stream_shape(gate):
     r = c.getresponse()
     data = r.read().decode()
     assert r.status == 200 and "event: message_start" in data and "event: message_stop" in data
+
+
+def test_cache_markers_normalized_for_every_arm(gate):
+    g, d = gate
+    g.open("cc01")
+    body = dict(BASE, system=[{"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+                tools=[{"name": "t", "input_schema": {"type": "object"}, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "b", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}],
+                cache_control={"type": "ephemeral", "ttl": "1h"})
+    st, _ = g.messages("cc01", body)
+    assert st == 200
+    sent = json.loads((d / "log" / "bodies" / "cc01" / "001.request.json").read_text())
+    assert sent["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in json.dumps({k: sent[k] for k in ("system", "tools", "messages")})
+    rec = [x for x in ledger(d) if x.get("event") == "request"][0]
+    assert rec["cache_markers_stripped"] == 4
+
+
+def test_usd_prices_one_hour_cache_writes_at_double_input():
+    u = {"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 1_000_000,
+         "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 1_000_000}}
+    assert abs(G.usd(G.AGENT_MODEL, u) - 2.0) < 1e-9
+    u["cache_creation"] = {"ephemeral_5m_input_tokens": 1_000_000, "ephemeral_1h_input_tokens": 0}
+    assert abs(G.usd(G.AGENT_MODEL, u) - 1.25) < 1e-9
+
+
+def test_worst_case_counts_tools_and_multibyte_text():
+    ja = "\u3042" * 3000   # 3000 chars, 9000 UTF-8 bytes
+    body = {"model": "x", "max_tokens": 10, "tools": [{"name": "t", "description": "d" * 6000,
+                                                       "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": ja}]}
+    _, f = G.apply_policy(body, "agent", {})
+    assert f["worst_input_tokens"] >= 9000 + 6000
+    assert f["est_input_tokens"] >= (9000 + 6000) // 3
+    big = {"model": "x", "max_tokens": 10, "messages": [{"role": "user", "content": "a" * 900_000}]}
+    _, f = G.apply_policy(big, "agent", {})
+    assert f["worst_input_tokens"] == G.CONTEXT_TOKENS[G.AGENT_MODEL]
+
+
+def test_unknown_cost_is_charged_worst_case(gate, monkeypatch):
+    g, d = gate
+    def boom(run, body):
+        raise ConnectionResetError("client went away")
+    monkeypatch.setattr(G.fake_model, "respond", boom)
+    g.open("wc01")
+    st, _ = g.messages("wc01", dict(BASE))
+    assert st == 502
+    rec = [x for x in ledger(d) if x.get("event") == "request"][0]
+    assert rec["charged_worst_case"] is True and rec["usd"] == rec["reserved_worst_usd"] > 0
+    s = g.close("wc01")
+    assert abs(s["usd"] - rec["reserved_worst_usd"]) < 1e-6
+    assert G.STATE.reserved == {"agent": 0.0, "judge": 0.0}
+
+
+def test_agent_runs_cannot_spend_the_judge_share(gate, monkeypatch):
+    g, _ = gate
+    G.STATE.spent["agent"] = G.PILOT_USD_CAP - G.JUDGE_USD_CAP - 0.001
+    g.open("ag01")
+    st, j = g.messages("ag01", dict(BASE))
+    assert st == 400 and "agent USD cap" in j["error"]["message"]
+    g.open("jd01", kind="judge")
+    st, _ = g.messages("jd01", dict(BASE, max_tokens=100))
+    assert st == 200
+
+
+def test_bad_content_length_refused(gate):
+    import socket
+    g, d = gate
+    g.open("cl01")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(f"{d}/runs/cl01/run.sock")
+    s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+    s.settimeout(5)
+    assert b" 400 " in s.recv(4096).split(b"\r\n")[0] + b" "
+    s.close()

@@ -162,6 +162,9 @@ CORE_XML = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 APP_XML = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
            b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
            b'<Application>anonymous</Application></Properties>')
+CUSTOM_XML = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+              b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" '
+              b'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"/>')
 
 
 def scrub_props(src: Path, dst: Path) -> list[str]:
@@ -174,6 +177,8 @@ def scrub_props(src: Path, dst: Path) -> list[str]:
                 data = CORE_XML
             elif item.filename == "docProps/app.xml":
                 data = APP_XML
+            elif item.filename == "docProps/custom.xml":
+                data = CUSTOM_XML
             elif item.filename.endswith((".xml", ".rels")):
                 for m in IDENTIFYING.finditer(data.decode("utf-8", "replace")):
                     flags.append(f"{item.filename}: {m.group(0)}")

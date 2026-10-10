@@ -16,19 +16,36 @@ Policy (identical for every arm; enforced per request)
     is answered locally with the pinned id. Everything else -> 403.
   * model is OVERWRITTEN with the pinned id for the run kind (agent / judge).
   * temperature/top_p/top_k/metadata/service_tier/output_config/inference_geo
-    are dropped; thinking is forced off; max_tokens is clamped to 8192;
-    top-level automatic cache_control is added.
+    are dropped; thinking is forced off; max_tokens is clamped to 8192.
+  * caching is identical for every arm: every client cache_control marker
+    (system, messages, tools; any TTL) is removed and one top-level automatic
+    5-minute cache_control is added (the API allows 4 breakpoints in total, and
+    a 1-hour TTL would be billed at 2x input).
   * rejected: unknown top-level keys, mcp_servers, container,
     context_management, fallbacks, speed, any non-custom tool (server tools),
     tool fields other than name/description/input_schema/cache_control/type,
-    image/document sources other than base64, > 30 images per request,
-    bodies > 16 MB. anthropic-beta (and every other client header) is never
-    forwarded; its presence is logged.
+    content blocks other than text/image/tool_use/tool_result (documents are
+    refused: they would bypass the image cap), image sources other than
+    base64, > 30 images per request, bodies > 16 MB. anthropic-beta (and every
+    other client header) is never forwarded; its presence is logged.
   * caps: per run <= 80 requests, <= 32 distinct image hashes, <= USD 0.50,
-    <= 15 min since open; per pilot <= USD 10 (judge share <= USD 2.5).
-    Costs are reserved before sending (worst case for the request) so a cap
-    cannot be overshot. A cap returns HTTP 400
+    <= 15 min since open; per pilot <= USD 10, split agent <= USD 7.5 and
+    judge <= USD 2.5 (so agent runs can never starve the judge).
+    Two reservations are made under one lock before a request is sent:
+      - an ESTIMATE (UTF-8 bytes / 3 + image tokens + max_tokens output) against
+        the per-run USD cap, a fairness budget that may be overshot by at most
+        the estimation error of the run's last admitted request;
+      - a WORST CASE (every UTF-8 byte a token, capped at the context window,
+        + the model's per-image maximum, all priced at the cache-write rate,
+        + max_tokens output) against the pilot / agent / judge caps, which
+        therefore cannot be overshot.
+    A request whose cost is unknown (upstream exception, client disconnect,
+    stream without a final message_delta, unparsable 200) is charged its worst
+    case. A cap returns HTTP 400
     {"type":"error","error":{"type":"budget_exhausted",...}} to every arm alike.
+  * the pilot cap lives in this process only: a gate restart or a new workflow
+    run starts at zero. The provider-side spend limit on the dedicated key is
+    the cross-run backstop.
   * tripwire: key-like strings in text are blocked; synthetic PII shapes are
     logged (the fixtures contain them on purpose).
   * ledger: one JSONL line per request; full request/response bodies saved
@@ -66,6 +83,11 @@ PRICES = {
 UPSTREAM_HOST = "api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 
+# Context window and per-image token ceiling per pinned model (worst-case reservation).
+CONTEXT_TOKENS = {AGENT_MODEL: 200_000, JUDGE_MODEL: 1_000_000}
+IMAGE_TOKENS_MAX = {AGENT_MODEL: 1_600, JUDGE_MODEL: 4_800}
+OVERHEAD_TOKENS = 2_000   # tool-use system prompt and message framing added by the API
+
 DEFAULT_RUN_CAPS = {"max_requests": 80, "max_images": 32, "max_usd": 0.50, "max_wall_s": 900}
 PILOT_USD_CAP = 10.0
 JUDGE_USD_CAP = 2.5
@@ -79,6 +101,7 @@ STRIP_KEYS = {"temperature", "top_p", "top_k", "metadata", "service_tier", "outp
               "thinking"}
 REJECT_KEYS = {"mcp_servers", "container", "context_management", "fallbacks", "speed", "betas", "diagnostics"}
 TOOL_KEYS = {"name", "description", "input_schema", "cache_control", "type"}
+BLOCK_TYPES = {"text", "image", "tool_use", "tool_result"}
 
 KEY_LIKE = re.compile(r"sk-ant-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
                       r"|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----")
@@ -103,11 +126,14 @@ class State:
         self.runs = {}            # run_id -> dict
         self.servers = {}         # run_id -> server
         self.spent = {"agent": 0.0, "judge": 0.0}
-        self.reserved = 0.0
+        self.reserved = {"agent": 0.0, "judge": 0.0}   # worst-case reservations in flight
         self.ledger = open(log_dir / "ledger.jsonl", "a", encoding="utf-8")
 
     def total_spent(self):
         return self.spent["agent"] + self.spent["judge"]
+
+    def kind_cap(self, kind):
+        return JUDGE_USD_CAP if kind == "judge" else PILOT_USD_CAP - JUDGE_USD_CAP
 
 
 STATE: State | None = None
@@ -115,9 +141,27 @@ STATE: State | None = None
 
 def usd(model, usage):
     pin, pout, pcw, pcr = PRICES[model]
+    cw = int(usage.get("cache_creation_input_tokens") or 0)
+    br = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+    cw1h = int(br.get("ephemeral_1h_input_tokens") or 0)   # never expected (markers are stripped); 2x input
+    cw_cost = max(0, cw - cw1h) * pcw + cw1h * 2 * pin
     return (int(usage.get("input_tokens") or 0) * pin + int(usage.get("output_tokens") or 0) * pout
-            + int(usage.get("cache_creation_input_tokens") or 0) * pcw
-            + int(usage.get("cache_read_input_tokens") or 0) * pcr) / 1e6
+            + cw_cost + int(usage.get("cache_read_input_tokens") or 0) * pcr) / 1e6
+
+
+def _strip_cache_markers(obj) -> int:
+    """Remove every cache_control key below the top level (system, messages, tools). Returns the count."""
+    n = 0
+    if isinstance(obj, dict):
+        if "cache_control" in obj:
+            obj.pop("cache_control")
+            n += 1
+        for v in obj.values():
+            n += _strip_cache_markers(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            n += _strip_cache_markers(v)
+    return n
 
 
 def _walk_blocks(content):
@@ -152,6 +196,8 @@ def apply_policy(body: dict, kind: str, headers) -> tuple[dict, dict]:
     except (TypeError, ValueError):
         mt = 4096
     body["max_tokens"] = max(1, min(mt, MAX_TOKENS))
+    body.pop("cache_control", None)
+    facts["cache_markers_stripped"] = sum(_strip_cache_markers(body.get(k)) for k in ("system", "messages", "tools"))
     body["cache_control"] = {"type": "ephemeral"}
     for t in body.get("tools") or []:
         if not isinstance(t, dict):
@@ -161,35 +207,39 @@ def apply_policy(body: dict, kind: str, headers) -> tuple[dict, dict]:
         extra = set(t) - TOOL_KEYS
         if extra or "input_schema" not in t or "name" not in t:
             raise PolicyError(400, "invalid_request_error", f"gate: tool fields refused: {sorted(extra)}")
-    images, texts = [], []
+    images, texts, image_chars = [], [], 0
     sysp = body.get("system")
     if isinstance(sysp, str):
         texts.append(sysp)
     elif isinstance(sysp, list):
         texts += [b.get("text", "") for b in sysp if isinstance(b, dict)]
     for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            raise PolicyError(400, "invalid_request_error", "gate: malformed message")
         c = m.get("content")
         if isinstance(c, str):
             texts.append(c)
             continue
+        if not isinstance(c, list):
+            raise PolicyError(400, "invalid_request_error", "gate: malformed message content")
         for b in _walk_blocks(c):
             t = b.get("type")
-            if t in ("image", "document"):
+            if t not in BLOCK_TYPES:
+                raise PolicyError(400, "invalid_request_error", f"gate: block type '{t}' refused")
+            if t == "image":
                 src = b.get("source") or {}
                 if src.get("type") != "base64":
                     raise PolicyError(400, "invalid_request_error",
                                       f"gate: {t} source '{src.get('type')}' refused (base64 only)")
-                if t == "image":
-                    images.append(hashlib.sha256(str(src.get("data", "")).encode()).hexdigest())
+                data = str(src.get("data", ""))
+                image_chars += len(data)
+                images.append(hashlib.sha256(data.encode()).hexdigest())
             elif t == "text":
                 texts.append(b.get("text", ""))
             elif t == "tool_result" and isinstance(b.get("content"), str):
                 texts.append(b["content"])
             elif t == "tool_use":
                 texts.append(json.dumps(b.get("input", {}), ensure_ascii=False))
-            elif t in ("server_tool_use", "web_search_tool_result", "web_fetch_tool_result", "mcp_tool_use",
-                       "container_upload"):
-                raise PolicyError(400, "invalid_request_error", f"gate: block type '{t}' refused")
     if len(images) > MAX_IMAGES_PER_REQUEST:
         raise PolicyError(400, "invalid_request_error", f"gate: {len(images)} images > {MAX_IMAGES_PER_REQUEST}")
     blob = "\n".join(texts)
@@ -197,7 +247,13 @@ def apply_policy(body: dict, kind: str, headers) -> tuple[dict, dict]:
         raise PolicyError(400, "invalid_request_error", "gate: key-like string in request blocked (tripwire)")
     facts["pii_shapes"] = len(PII_SHAPE.findall(blob))
     facts["image_hashes"] = images
-    facts["est_input_tokens"] = len(blob) // 3 + 1600 * len(images) + 2000
+    # Everything that is not image data counts as text: system, messages, tool schemas, JSON framing.
+    # base64 is ASCII, so its UTF-8 length equals its character count.
+    text_bytes = max(0, len(json.dumps(body, ensure_ascii=False).encode()) - image_chars)
+    model = body["model"]
+    img_tokens = IMAGE_TOKENS_MAX[model] * len(images)
+    facts["est_input_tokens"] = text_bytes // 3 + img_tokens + OVERHEAD_TOKENS
+    facts["worst_input_tokens"] = min(CONTEXT_TOKENS[model], text_bytes + img_tokens + OVERHEAD_TOKENS)
     facts["tools_offered"] = [t.get("name") for t in body.get("tools") or []]
     return body, facts
 
@@ -260,7 +316,13 @@ class RunHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/v1/messages", "/v1/messages/count_tokens"):
             return self._forbid()
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0:
+            self.close_connection = True
+            return self._send(400, err_body("invalid_request_error", "gate: bad Content-Length"))
         if n > MAX_BODY:
             self._ledger({"event": "refused", "reason": "body too large", "bytes": n})
             self.close_connection = True
@@ -290,9 +352,11 @@ class RunHandler(BaseHTTPRequestHandler):
             status, data, _ = upstream_plain(st.key, "/v1/messages/count_tokens", body)
             self._ledger({"event": "count_tokens", "status": status})
             return self._send(status, data)
-        # ---- caps (reserve worst case before sending)
+        # ---- caps: estimate for the per-run budget, worst case for the money caps
         pin, pout, pcw, _ = PRICES[model]
+        kind = run["kind"]
         reserve = (facts["est_input_tokens"] * pcw + body["max_tokens"] * pout) / 1e6
+        worst = (facts["worst_input_tokens"] * pcw + body["max_tokens"] * pout) / 1e6
         with st.lock:
             caps = run["caps"]
             new_imgs = set(facts["image_hashes"]) - run["images"]
@@ -307,17 +371,17 @@ class RunHandler(BaseHTTPRequestHandler):
                 reason = f"run distinct-image cap ({caps['max_images']})"
             elif run["usd"] + run["reserved"] + reserve > caps["max_usd"]:
                 reason = f"run USD cap ({caps['max_usd']})"
-            elif st.total_spent() + st.reserved + reserve > PILOT_USD_CAP:
+            elif st.total_spent() + sum(st.reserved.values()) + worst > PILOT_USD_CAP:
                 reason = f"pilot USD cap ({PILOT_USD_CAP})"
-            elif run["kind"] == "judge" and st.spent["judge"] + reserve > JUDGE_USD_CAP:
-                reason = f"judge USD cap ({JUDGE_USD_CAP})"
+            elif st.spent[kind] + st.reserved[kind] + worst > st.kind_cap(kind):
+                reason = f"{kind} USD cap ({st.kind_cap(kind)})"
             if reason:
                 run["capped"] += 1
             else:
                 run["requests"] += 1
                 run["images"] |= new_imgs
                 run["reserved"] += reserve
-                st.reserved += reserve
+                st.reserved[kind] += worst
                 seq = run["requests"]
         if reason:
             self._ledger({"event": "budget_exhausted", "reason": reason})
@@ -327,6 +391,7 @@ class RunHandler(BaseHTTPRequestHandler):
         save_dir.mkdir(parents=True, exist_ok=True)
         (save_dir / f"{seq:03d}.request.json").write_bytes(json.dumps(body, ensure_ascii=False).encode())
         usage, status, stop, used_tools, err = {}, 0, None, [], None
+        self.upstream_request_id = None
         try:
             if st.mode == "fake":
                 msg = fake_model.respond(run, body)
@@ -348,11 +413,16 @@ class RunHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         cost = usd(model, usage) if usage else 0.0
+        # Unknown cost (exception, client gone, truncated stream, unparsable 200): charge the worst case.
+        complete = status == 200 and bool(usage) and (stop is not None or not stream)
+        charged_worst = err is not None or (status == 200 and not complete)
+        if charged_worst:
+            cost = max(cost, worst)
         with st.lock:
             run["reserved"] -= reserve
-            st.reserved -= reserve
+            st.reserved[kind] -= worst
             run["usd"] += cost
-            st.spent[run["kind"]] += cost
+            st.spent[kind] += cost
             for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
                 run["usage"][k] = run["usage"].get(k, 0) + int(usage.get(k) or 0)
         (save_dir / f"{seq:03d}.response.{'sse' if stream else 'json'}").write_bytes(
@@ -362,6 +432,9 @@ class RunHandler(BaseHTTPRequestHandler):
                       "stream": stream, "latency_s": round(time.time() - t0, 3), "usage": usage,
                       "usd": round(cost, 6), "images": len(facts["image_hashes"]),
                       "new_images": len(set(facts["image_hashes"])), "max_tokens": body["max_tokens"],
+                      "charged_worst_case": charged_worst, "reserved_est_usd": round(reserve, 6),
+                      "reserved_worst_usd": round(worst, 6), "upstream_request_id": self.upstream_request_id,
+                      "cache_markers_stripped": facts["cache_markers_stripped"],
                       "stripped": facts["stripped"], "betas_dropped": facts["betas_dropped"],
                       "pii_shapes": facts["pii_shapes"], "tools_offered": facts["tools_offered"],
                       "tools_used": used_tools, "stop_reason": stop, "error": err,
@@ -369,10 +442,17 @@ class RunHandler(BaseHTTPRequestHandler):
 
     def _forward_real(self, body, stream):
         conn = http.client.HTTPSConnection(UPSTREAM_HOST, 443, timeout=300, context=ssl.create_default_context())
+        try:
+            return self._forward_on(conn, body, stream)
+        finally:
+            conn.close()   # also on a client disconnect mid-stream: stop reading upstream at once
+
+    def _forward_on(self, conn, body, stream):
         payload = json.dumps(body).encode()
         conn.request("POST", "/v1/messages", body=payload, headers={
             "content-type": "application/json", "x-api-key": STATE.key, "anthropic-version": ANTHROPIC_VERSION})
         resp = conn.getresponse()
+        self.upstream_request_id = resp.getheader("request-id")
         usage, stop, tools = {}, None, []
         if not stream or resp.status != 200:
             data = resp.read()

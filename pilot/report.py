@@ -158,6 +158,9 @@ def write(out: Path, meta: dict, arm_map: dict, scores: dict, pairs: dict, selft
         "capped_runs": {arm: sum(1 for r in rs if r["capped"]) for arm, rs in per_arm.items()},
         "infra_errors": {arm: sum(1 for r in rs if r["driver_status"] is None or str(r["driver_status"]).startswith(
             ("fail_closed", "driver_crash", "model_error"))) for arm, rs in per_arm.items()},
+        "hermes_approval_policy": meta.get("hermes_approval"),
+        "hermes_guard_denials_scored_runs": sum(r["approvals"] or 0 for r in per_arm.get(H, [])),
+        "hermes_runs_with_denials": sum(1 for r in per_arm.get(H, []) if r["approvals"]),
     }
     outcome = screening_outcome(delta, ci, wins, len(inst), agg.get(H, {}).get("completed", 0),
                                 agg.get(B, {}).get("completed", 0), h_pref if h_pref is not None else 0.5,
@@ -188,7 +191,13 @@ def write(out: Path, meta: dict, arm_map: dict, scores: dict, pairs: dict, selft
                  f"| {a['wall_p50']}/{a['wall_p95']} | {a['requests_mean']} |")
     L += ["", f"Delta Q (H - B): {delta:.1f}, 90% cluster bootstrap {ci[0]:.1f}..{ci[1]:.1f}; sign test {wins}/{nz} "
           f"(p = {sign_test_p(wins, nz):.2f}); pairwise H preference {h_pref}." if delta == delta else
-          "", f"Screening outcome: **{outcome}**", "", "## Runs", "",
+          "", f"Screening outcome: **{outcome}**", "",
+          *([f"> **Confound:** Hermes ran with command-guard policy `deny` and its guard was denied "
+             f"{validity['hermes_guard_denials_scored_runs']} time(s) in {validity['hermes_runs_with_denials']} "
+             "scored run(s). Denied commands are friction the typed arm never meets; read any Hermes shortfall "
+             "with that in mind.", ""] if validity["hermes_approval_policy"] == "deny"
+            and validity["hermes_guard_denials_scored_runs"] else []),
+          "## Runs", "",
           "| task | rep | arm | scenario | completed | Q | USD | req | wall s | driver | first failure |",
           "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:

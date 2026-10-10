@@ -68,10 +68,14 @@ completion, plus gate-ledger cost and latency.
 
 ## Running the paid pilot (operator steps)
 
-1. Create a dedicated API key in a workspace with a provider-side spend limit of
-   about USD 10-15.
-2. Store it as secret `BAKEOFF_ANTHROPIC_API_KEY` in the `bakeoff` environment
-   (not as a repository secret).
-3. Dispatch `pptx-pilot-paid` with `confirm = RUN-PAID-PILOT` and approve the
-   environment deployment.
-4. Revoke the key afterwards.
+1. Create a dedicated workspace in the provider console with a **monthly spend
+   limit of USD 10** (this is the only cap that survives re-runs), and create
+   one API key in it.
+2. Immediately before the run, store the key as secret `BAKEOFF_ANTHROPIC_API_KEY`
+   in the `bakeoff` environment (not as a repository secret). The environment
+   allows deployments from `main` only and requires a reviewer.
+3. Dispatch `pptx-pilot-paid` from `main` with `confirm = RUN-PAID-PILOT` and the
+   chosen `hermes_approval`, then approve the environment deployment yourself.
+4. Do not re-run a failed paid run without checking its spend first: every run
+   gets a fresh USD 10 gate cap.
+5. Afterwards delete the environment secret and revoke the key in the console.

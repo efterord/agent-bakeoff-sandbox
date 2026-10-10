@@ -65,30 +65,33 @@ def run(name: str, image: str, entry: list[str], in_dir: Path, out_dir: Path, ga
              *[x for k, v in sorted((extra_env or {}).items()) if k.startswith("PILOT_") for x in ("--env", f"{k}={v}")],
              "--entrypoint", entry[0], image, *entry[1:]]
     t0 = time.time()
-    started = sh(argv, check=False)
-    res = {"name": name, "docker_run_rc": started.returncode, "docker_run_err": started.stderr[-500:]}
-    if started.returncode != 0:
+    res = {"name": name}
+    try:
+        started = sh(argv, check=False)
+        res.update(docker_run_rc=started.returncode, docker_run_err=started.stderr[-500:])
+        if started.returncode != 0:
+            return res
+        try:
+            w = sh(["docker", "wait", name], check=False, timeout=wall_s + 30)
+            res["exit_code"] = int(w.stdout.strip() or -1)
+        except subprocess.TimeoutExpired:
+            res["exit_code"], res["wall_clock_limit_hit"] = None, True
+        res["wall_s"] = round(time.time() - t0, 1)
+        insp = sh(["docker", "inspect", name], check=False)
+        try:
+            hc = json.loads(insp.stdout)[0]["HostConfig"]
+            res["effective"] = {k: hc.get(k) for k in ("NetworkMode", "ReadonlyRootfs", "CapDrop", "CapAdd",
+                                                       "SecurityOpt", "PidsLimit", "Memory", "MemorySwap",
+                                                       "NanoCpus", "Privileged", "IpcMode", "Ulimits", "Init")}
+            res["oom_killed"] = json.loads(insp.stdout)[0]["State"].get("OOMKilled")
+        except Exception:
+            pass
+        logs = sh(["docker", "logs", "--tail", "200", name], check=False)
+        res["log_tail"] = (logs.stdout + logs.stderr)[-6000:]
         return res
-    try:
-        w = sh(["docker", "wait", name], check=False, timeout=wall_s + 30)
-        res["exit_code"] = int(w.stdout.strip() or -1)
-    except subprocess.TimeoutExpired:
-        res["exit_code"], res["wall_clock_limit_hit"] = None, True
-    res["wall_s"] = round(time.time() - t0, 1)
-    insp = sh(["docker", "inspect", name], check=False)
-    try:
-        hc = json.loads(insp.stdout)[0]["HostConfig"]
-        res["effective"] = {k: hc.get(k) for k in ("NetworkMode", "ReadonlyRootfs", "CapDrop", "CapAdd", "SecurityOpt",
-                                                   "PidsLimit", "Memory", "MemorySwap", "NanoCpus", "Privileged",
-                                                   "IpcMode", "Ulimits", "Init")}
-        res["oom_killed"] = json.loads(insp.stdout)[0]["State"].get("OOMKilled")
-    except Exception:
-        pass
-    logs = sh(["docker", "logs", "--tail", "200", name], check=False)
-    res["log_tail"] = (logs.stdout + logs.stderr)[-6000:]
-    sh(["docker", "rm", "-f", name], check=False)
-    res["removed"] = sh(["docker", "inspect", name], check=False).returncode != 0
-    return res
+    finally:  # removed on EVERY path (docker run failure, timeout, any exception)
+        sh(["docker", "rm", "-f", name], check=False)
+        res["removed"] = sh(["docker", "inspect", name], check=False).returncode != 0
 
 
 def release(tdir: Path) -> None:
